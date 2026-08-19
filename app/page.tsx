@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import ImageConverter from "./ImageConverter";
 
 export const metadata: Metadata = {
-  title: "PixelLock — Strict Dimension Image Compressor",
+  title: "PixelLock — Local Folder Image Compressor",
   description:
-    "Compress images to a strict file-size limit without changing a single pixel dimension.",
+    "Convert a local Input folder into a matching Output folder without changing image dimensions.",
 };
 
 export default function Home() {

@@ -1,9 +1,6 @@
 "use client";
 
 import {
-  ChangeEvent,
-  DragEvent,
-  KeyboardEvent,
   useEffect,
   useMemo,
   useRef,
@@ -22,18 +19,54 @@ type QueueStatus = "ready" | "processing" | "done" | "failed" | "cancelled";
 type QueueItem = {
   id: string;
   file: File;
+  relativeDirectory: string;
   sourceUrl: string;
   status: QueueStatus;
-  resultUrl?: string;
   resultBlob?: Blob;
   resultName?: string;
   width?: number;
   height?: number;
   parameter?: number;
   parameterLabel?: "Quality" | "Colors";
+  outputRelativePath?: string;
   update?: SearchUpdate;
   error?: string;
 };
+
+type LocalFileHandle = {
+  kind: "file";
+  name: string;
+  getFile(): Promise<File>;
+  createWritable(): Promise<{
+    write(data: Blob): Promise<void>;
+    close(): Promise<void>;
+  }>;
+};
+
+type LocalDirectoryHandle = {
+  kind: "directory";
+  name: string;
+  values(): AsyncIterableIterator<LocalFileHandle | LocalDirectoryHandle>;
+  getDirectoryHandle(
+    name: string,
+    options: { create: boolean },
+  ): Promise<LocalDirectoryHandle>;
+  getFileHandle(
+    name: string,
+    options: { create: boolean },
+  ): Promise<LocalFileHandle>;
+  isSameEntry(other: LocalDirectoryHandle): Promise<boolean>;
+};
+
+declare global {
+  interface Window {
+    showDirectoryPicker?: (options?: {
+      id?: string;
+      mode?: "read" | "readwrite";
+    }) => Promise<LocalDirectoryHandle>;
+    webkitAudioContext?: typeof AudioContext;
+  }
+}
 
 const formats: Array<{
   value: OutputFormat;
@@ -57,13 +90,47 @@ function isAccepted(file: File) {
   return file.type.startsWith("image/") || acceptedExtensions.includes(extension);
 }
 
-function download(url: string, name: string) {
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
+async function collectFolderImages(
+  directory: LocalDirectoryHandle,
+  relativeDirectory = "",
+): Promise<Array<{ file: File; relativeDirectory: string }>> {
+  const images: Array<{ file: File; relativeDirectory: string }> = [];
+
+  for await (const entry of directory.values()) {
+    if (entry.kind === "directory") {
+      const nestedPath = relativeDirectory
+        ? `${relativeDirectory}/${entry.name}`
+        : entry.name;
+      images.push(...(await collectFolderImages(entry, nestedPath)));
+      continue;
+    }
+
+    const file = await entry.getFile();
+    if (isAccepted(file)) images.push({ file, relativeDirectory });
+  }
+
+  return images.sort((a, b) => {
+    const pathA = `${a.relativeDirectory}/${a.file.name}`;
+    const pathB = `${b.relativeDirectory}/${b.file.name}`;
+    return pathA.localeCompare(pathB, undefined, { numeric: true });
+  });
+}
+
+async function writeToOutputFolder(
+  outputRoot: LocalDirectoryHandle,
+  relativeDirectory: string,
+  fileName: string,
+  blob: Blob,
+) {
+  let destination = outputRoot;
+  for (const segment of relativeDirectory.split("/").filter(Boolean)) {
+    destination = await destination.getDirectoryHandle(segment, { create: true });
+  }
+
+  const fileHandle = await destination.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(blob);
+  await writable.close();
 }
 
 export default function ImageConverter() {
@@ -71,11 +138,13 @@ export default function ImageConverter() {
   const [sizeMode, setSizeMode] = useState<"100" | "150" | "200" | "custom">("100");
   const [customSize, setCustomSize] = useState("120");
   const [items, setItems] = useState<QueueItem[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
+  const [inputDirectory, setInputDirectory] = useState<LocalDirectoryHandle | null>(null);
+  const [outputDirectory, setOutputDirectory] = useState<LocalDirectoryHandle | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [batchMessage, setBatchMessage] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [showLongRunningMessage, setShowLongRunningMessage] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const completionAudioRef = useRef<AudioContext | null>(null);
   const itemsRef = useRef(items);
 
   useEffect(() => {
@@ -86,12 +155,20 @@ export default function ImageConverter() {
     () => () => {
       itemsRef.current.forEach((item) => {
         URL.revokeObjectURL(item.sourceUrl);
-        if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
       });
       abortRef.current?.abort();
+      if (completionAudioRef.current?.state !== "closed") {
+        void completionAudioRef.current?.close();
+      }
     },
     [],
   );
+
+  useEffect(() => {
+    if (!isProcessing) return;
+    const timer = window.setTimeout(() => setShowLongRunningMessage(true), 5000);
+    return () => window.clearTimeout(timer);
+  }, [isProcessing]);
 
   const maxSizeKb = useMemo(() => {
     if (sizeMode === "custom") return Number(customSize);
@@ -103,39 +180,109 @@ export default function ImageConverter() {
     (item) => item.status === "ready" || item.status === "failed" || item.status === "cancelled",
   ).length;
 
-  const addFiles = (files: File[]) => {
-    const accepted = files.filter(isAccepted);
-    const rejectedCount = files.length - accepted.length;
-    const nextItems = accepted.map<QueueItem>((file) => ({
-      id: createId(file),
-      file,
-      sourceUrl: URL.createObjectURL(file),
-      status: "ready",
-    }));
-    setItems((current) => [...current, ...nextItems]);
-    setBatchMessage(
-      rejectedCount
-        ? `${rejectedCount} unsupported ${rejectedCount === 1 ? "file was" : "files were"} skipped.`
-        : "",
+  const clearItemUrls = (entries: QueueItem[]) => {
+    entries.forEach((item) => {
+      URL.revokeObjectURL(item.sourceUrl);
+    });
+  };
+
+  const chooseInputFolder = async () => {
+    if (!window.showDirectoryPicker) {
+      setBatchMessage(
+        "Folder access needs Chrome or Edge. Open this local app in one of those browsers.",
+      );
+      return;
+    }
+
+    try {
+      const directory = await window.showDirectoryPicker({ id: "pixellock-input", mode: "read" });
+      if (outputDirectory && (await directory.isSameEntry(outputDirectory))) {
+        setBatchMessage("Input and Output must be different folders.");
+        return;
+      }
+
+      setBatchMessage("Scanning the Input folder and its subfolders…");
+      const folderImages = await collectFolderImages(directory);
+      const nextItems = folderImages.map<QueueItem>(({ file, relativeDirectory }) => ({
+        id: createId(file),
+        file,
+        relativeDirectory,
+        sourceUrl: URL.createObjectURL(file),
+        status: "ready",
+      }));
+      setItems((current) => {
+        clearItemUrls(current);
+        return nextItems;
+      });
+      setInputDirectory(directory);
+      setBatchMessage(
+        nextItems.length
+          ? `Found ${nextItems.length} supported ${nextItems.length === 1 ? "image" : "images"} in ${directory.name}.`
+          : `No supported images were found in ${directory.name}.`,
+      );
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        setBatchMessage("The Input folder could not be opened.");
+      }
+    }
+  };
+
+  const chooseOutputFolder = async () => {
+    if (!window.showDirectoryPicker) {
+      setBatchMessage(
+        "Folder access needs Chrome or Edge. Open this local app in one of those browsers.",
+      );
+      return;
+    }
+
+    try {
+      const directory = await window.showDirectoryPicker({
+        id: "pixellock-output",
+        mode: "readwrite",
+      });
+      if (inputDirectory && (await directory.isSameEntry(inputDirectory))) {
+        setBatchMessage("Input and Output must be different folders.");
+        return;
+      }
+      setOutputDirectory(directory);
+      setBatchMessage(`Converted files will be written directly into ${directory.name}.`);
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        setBatchMessage("The Output folder could not be opened for writing.");
+      }
+    }
+  };
+
+  const resetCompletedResults = () => {
+    setItems((current) =>
+      current.map((item) => {
+        return {
+          ...item,
+          status: "ready",
+          resultBlob: undefined,
+          resultName: undefined,
+          outputRelativePath: undefined,
+          width: undefined,
+          height: undefined,
+          parameter: undefined,
+          parameterLabel: undefined,
+          update: undefined,
+          error: undefined,
+        };
+      }),
     );
   };
 
-  const handleInput = (event: ChangeEvent<HTMLInputElement>) => {
-    addFiles(Array.from(event.target.files ?? []));
-    event.target.value = "";
+  const changeFormat = (nextFormat: OutputFormat) => {
+    if (nextFormat === format) return;
+    setFormat(nextFormat);
+    resetCompletedResults();
   };
 
-  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setIsDragging(false);
-    addFiles(Array.from(event.dataTransfer.files));
-  };
-
-  const handleDropKey = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      inputRef.current?.click();
-    }
+  const changeSizeMode = (nextMode: "100" | "150" | "200" | "custom") => {
+    if (nextMode === sizeMode) return;
+    setSizeMode(nextMode);
+    resetCompletedResults();
   };
 
   const updateItem = (id: string, patch: Partial<QueueItem>) => {
@@ -144,8 +291,48 @@ export default function ImageConverter() {
     );
   };
 
+  const prepareCompletionAudio = () => {
+    const AudioContextClass = window.AudioContext ?? window.webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    try {
+      if (!completionAudioRef.current || completionAudioRef.current.state === "closed") {
+        completionAudioRef.current = new AudioContextClass();
+      }
+      void completionAudioRef.current.resume();
+    } catch {
+      // Audio is a small enhancement; conversion should continue if it is unavailable.
+    }
+  };
+
+  const playCompletionChime = () => {
+    const context = completionAudioRef.current;
+    if (!context || context.state === "closed") return;
+
+    void context.resume().then(() => {
+      const now = context.currentTime;
+      [523.25, 659.25, 783.99].forEach((frequency, index) => {
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        const start = now + index * 0.18;
+
+        oscillator.type = "triangle";
+        oscillator.frequency.setValueAtTime(frequency, start);
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.24, start + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.52);
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+        oscillator.start(start);
+        oscillator.stop(start + 0.54);
+      });
+    }).catch(() => {
+      // Some browser audio policies can still block playback; the completion text remains.
+    });
+  };
+
   const processBatch = async () => {
-    if (!items.length || isProcessing) return;
+    if (!items.length || !outputDirectory || isProcessing) return;
     if (!Number.isFinite(maxSizeKb) || maxSizeKb <= 0.5) {
       setBatchMessage("Enter a maximum size greater than 0.5 KB.");
       return;
@@ -155,8 +342,10 @@ export default function ImageConverter() {
     abortRef.current = controller;
     setIsProcessing(true);
     setBatchMessage("");
+    setShowLongRunningMessage(false);
     const queue = items.filter((item) => item.status !== "done");
     let succeeded = 0;
+    prepareCompletionAudio();
 
     for (const item of queue) {
       if (controller.signal.aborted) break;
@@ -170,12 +359,21 @@ export default function ImageConverter() {
           (update) => updateItem(item.id, { update }),
           controller.signal,
         );
-        const resultUrl = URL.createObjectURL(result.blob);
+        const resultName = outputName(item.file.name, format);
+        await writeToOutputFolder(
+          outputDirectory,
+          item.relativeDirectory,
+          resultName,
+          result.blob,
+        );
+        const outputRelativePath = item.relativeDirectory
+          ? `${outputDirectory.name}/${item.relativeDirectory}/${resultName}`
+          : `${outputDirectory.name}/${resultName}`;
         updateItem(item.id, {
           status: "done",
           resultBlob: result.blob,
-          resultUrl,
-          resultName: outputName(item.file.name, format),
+          resultName,
+          outputRelativePath,
           width: result.width,
           height: result.height,
           parameter: result.parameter,
@@ -196,15 +394,17 @@ export default function ImageConverter() {
     }
 
     setIsProcessing(false);
+    setShowLongRunningMessage(false);
     abortRef.current = null;
     if (controller.signal.aborted) {
       setBatchMessage("Processing stopped. Finished files are still available.");
     } else {
       setBatchMessage(
         succeeded === queue.length
-          ? `${succeeded} ${succeeded === 1 ? "image" : "images"} ready to download.`
+          ? `${succeeded} ${succeeded === 1 ? "image was" : "images were"} written to ${outputDirectory.name}.`
           : `${succeeded} of ${queue.length} images completed. Review the file notes below.`,
       );
+      playCompletionChime();
     }
   };
 
@@ -215,7 +415,6 @@ export default function ImageConverter() {
       const item = current.find((entry) => entry.id === id);
       if (item) {
         URL.revokeObjectURL(item.sourceUrl);
-        if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
       }
       return current.filter((entry) => entry.id !== id);
     });
@@ -225,29 +424,11 @@ export default function ImageConverter() {
     abortRef.current?.abort();
     items.forEach((item) => {
       URL.revokeObjectURL(item.sourceUrl);
-      if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
     });
     setItems([]);
+    setInputDirectory(null);
     setBatchMessage("");
-  };
-
-  const downloadAll = async () => {
-    if (!completeItems.length) return;
-    if (completeItems.length === 1) {
-      const item = completeItems[0];
-      if (item.resultUrl && item.resultName) download(item.resultUrl, item.resultName);
-      return;
-    }
-
-    const JSZip = (await import("jszip")).default;
-    const zip = new JSZip();
-    completeItems.forEach((item) => {
-      if (item.resultBlob && item.resultName) zip.file(item.resultName, item.resultBlob);
-    });
-    const blob = await zip.generateAsync({ type: "blob", compression: "STORE" });
-    const url = URL.createObjectURL(blob);
-    download(url, `pixellock-${format.toLowerCase()}-images.zip`);
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setShowLongRunningMessage(false);
   };
 
   return (
@@ -261,14 +442,13 @@ export default function ImageConverter() {
         </a>
         <div className="header-status">
           <span className="status-dot" aria-hidden="true" />
-          Private browser processing
+          Local folder processing
         </div>
       </header>
 
       <section className="hero" id="top">
         <div className="eyebrow">
-          <span>01</span>
-          Strict dimension compressor
+          Deisgned By Ranjith (With AI)
         </div>
         <div className="hero-grid">
           <h1>
@@ -278,13 +458,13 @@ export default function ImageConverter() {
           </h1>
           <div className="hero-copy">
             <p>
-              Hit an exact file-size ceiling without resizing. PixelLock searches
-              for the highest usable quality at your image’s original dimensions.
+              Put images in an Input folder and write finished files to an Output
+              folder. Every nested folder is recreated automatically.
             </p>
             <div className="rule-strip" aria-label="Core rules">
               <span>0 px resized</span>
-              <span>0.5 KB safety</span>
-              <span>100% local</span>
+              <span>Folders preserved</span>
+              <span>Localhost only</span>
             </div>
           </div>
         </div>
@@ -295,53 +475,83 @@ export default function ImageConverter() {
           <div className="section-heading">
             <div>
               <span className="step-number">01</span>
-              <h2>Add your images</h2>
+              <h2>Choose Input and Output</h2>
             </div>
             <span className="file-count">
               {items.length} {items.length === 1 ? "file" : "files"}
             </span>
           </div>
 
-          <div
-            className={`drop-zone${isDragging ? " is-dragging" : ""}`}
-            onClick={() => inputRef.current?.click()}
-            onKeyDown={handleDropKey}
-            onDragEnter={(event) => {
-              event.preventDefault();
-              setIsDragging(true);
-            }}
-            onDragOver={(event) => event.preventDefault()}
-            onDragLeave={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget as Node)) {
-                setIsDragging(false);
-              }
-            }}
-            onDrop={handleDrop}
-            role="button"
-            tabIndex={0}
-            aria-label="Choose images or drop them here"
-          >
-            <input
-              ref={inputRef}
-              type="file"
-              accept="image/png,image/jpeg,image/webp,image/bmp,image/heic,image/heif,image/avif,.heic,.heif"
-              multiple
-              onChange={handleInput}
-            />
-            <div className="drop-icon" aria-hidden="true">
-              <span>+</span>
+          <div className="folder-workflow">
+            <section className={`folder-card${inputDirectory ? " selected" : ""}`}>
+              <div className="folder-card-top">
+                <span className="folder-label">Input</span>
+                <span className="folder-state">{inputDirectory ? "Connected" : "Required"}</span>
+              </div>
+              <div className="folder-symbol" aria-hidden="true">
+                <span>IN</span>
+              </div>
+              <div className="folder-copy">
+                <strong>{inputDirectory?.name ?? "Input folder"}</strong>
+                <p>
+                  {inputDirectory
+                    ? `${items.length} supported ${items.length === 1 ? "image" : "images"} found`
+                    : "PixelLock scans every nested folder for supported images."}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="folder-button"
+                onClick={chooseInputFolder}
+                disabled={isProcessing}
+              >
+                {inputDirectory ? "Change Input" : "Choose Input folder"}
+                <span>→</span>
+              </button>
+            </section>
+
+            <div className="flow-arrow" aria-hidden="true">
+              <span>→</span>
+              <small>convert</small>
             </div>
-            <div>
-              <strong>Drop files here</strong>
-              <span>or click to browse</span>
-            </div>
-            <p>PNG, JPG, WebP, BMP, HEIC, AVIF · Batch supported</p>
+
+            <section className={`folder-card${outputDirectory ? " selected" : ""}`}>
+              <div className="folder-card-top">
+                <span className="folder-label">Output</span>
+                <span className="folder-state">{outputDirectory ? "Writable" : "Required"}</span>
+              </div>
+              <div className="folder-symbol output" aria-hidden="true">
+                <span>OUT</span>
+              </div>
+              <div className="folder-copy">
+                <strong>{outputDirectory?.name ?? "Output folder"}</strong>
+                <p>
+                  {outputDirectory
+                    ? "Ready to receive converted files and matching subfolders."
+                    : "Finished files are written here—not downloaded one by one."}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="folder-button"
+                onClick={chooseOutputFolder}
+                disabled={isProcessing}
+              >
+                {outputDirectory ? "Change Output" : "Choose Output folder"}
+                <span>→</span>
+              </button>
+            </section>
           </div>
+
+          <p className="folder-note">
+            Example: <strong>Input/products/shoe.png</strong> becomes{" "}
+            <strong>Output/products/shoe.{format.toLowerCase() === "jpeg" ? "jpg" : format.toLowerCase()}</strong>.
+          </p>
 
           {items.length > 0 && (
             <div className="queue" aria-live="polite">
               <div className="queue-header">
-                <h3>Batch queue</h3>
+                <h3>Input folder queue</h3>
                 <button type="button" className="text-button" onClick={reset} disabled={isProcessing}>
                   Clear all
                 </button>
@@ -358,6 +568,7 @@ export default function ImageConverter() {
                     <div className="file-details">
                       <strong title={item.file.name}>{item.file.name}</strong>
                       <span>
+                        {item.relativeDirectory ? `${item.relativeDirectory}/` : "Input root · "}
                         {formatDecimalKb(item.file.size)}
                         {item.width && item.height ? ` · ${item.width} × ${item.height} px` : ""}
                       </span>
@@ -380,7 +591,7 @@ export default function ImageConverter() {
                       {item.error && <p className="file-error">{item.error}</p>}
                       {item.status === "done" && item.resultBlob && (
                         <p className="file-success">
-                          {formatDecimalKb(item.resultBlob.size)} · {item.parameterLabel} {item.parameter} · Dimensions locked
+                          {formatDecimalKb(item.resultBlob.size)} · {item.parameterLabel} {item.parameter} · Written to {item.outputRelativePath}
                         </p>
                       )}
                     </div>
@@ -389,19 +600,13 @@ export default function ImageConverter() {
                         {item.status === "ready" && "Ready"}
                         {item.status === "processing" && "Searching"}
                         {item.status === "done" && "Complete"}
-                        {item.status === "failed" && "Couldn’t fit"}
+                        {item.status === "failed" && "Failed"}
                         {item.status === "cancelled" && "Stopped"}
                       </span>
-                      {item.status === "done" && item.resultUrl && item.resultName ? (
-                        <a
-                          className="icon-button download-button"
-                          href={item.resultUrl}
-                          download={item.resultName}
-                          aria-label={`Download ${item.resultName}`}
-                          title="Download file"
-                        >
-                          ↓
-                        </a>
+                      {item.status === "done" ? (
+                        <span className="output-check" aria-label="Written to Output" title="Written to Output">
+                          ✓
+                        </span>
                       ) : (
                         <button
                           type="button"
@@ -441,7 +646,7 @@ export default function ImageConverter() {
                     name="format"
                     value={option.value}
                     checked={format === option.value}
-                    onChange={() => setFormat(option.value)}
+                    onChange={() => changeFormat(option.value)}
                     disabled={isProcessing}
                   />
                   <strong>{option.label}</strong>
@@ -460,7 +665,7 @@ export default function ImageConverter() {
                     type="radio"
                     name="size"
                     checked={sizeMode === size}
-                    onChange={() => setSizeMode(size)}
+                    onChange={() => changeSizeMode(size)}
                     disabled={isProcessing}
                   />
                   <strong>{size}</strong>
@@ -472,7 +677,7 @@ export default function ImageConverter() {
                   type="radio"
                   name="size"
                   checked={sizeMode === "custom"}
-                  onChange={() => setSizeMode("custom")}
+                  onChange={() => changeSizeMode("custom")}
                   disabled={isProcessing}
                 />
                 <span>Custom</span>
@@ -487,7 +692,10 @@ export default function ImageConverter() {
                     min="1"
                     step="0.5"
                     value={customSize}
-                    onChange={(event) => setCustomSize(event.target.value)}
+                    onChange={(event) => {
+                      setCustomSize(event.target.value);
+                      resetCompletedResults();
+                    }}
                     disabled={isProcessing}
                     aria-label="Custom maximum size in kilobytes"
                   />
@@ -510,66 +718,55 @@ export default function ImageConverter() {
           </div>
 
           {isProcessing ? (
-            <button type="button" className="primary-button cancel" onClick={cancelBatch}>
-              Stop processing
-              <span>×</span>
+            <button
+              type="button"
+              className="primary-button processing"
+              onClick={cancelBatch}
+              aria-label="Stop processing"
+            >
+              <span className="processing-label">
+                <span className="button-spinner" aria-hidden="true" />
+                Converting images…
+              </span>
+              <span className="button-stop">Stop</span>
             </button>
           ) : (
             <button
               type="button"
               className="primary-button"
               onClick={processBatch}
-              disabled={!items.length || pendingCount === 0}
+              disabled={!items.length || !outputDirectory || pendingCount === 0}
             >
-              {completeItems.length ? "Process remaining" : "Compress images"}
+              {completeItems.length ? "Process remaining" : "Convert Input to Output"}
               <span>→</span>
-            </button>
-          )}
-
-          {completeItems.length > 0 && !isProcessing && (
-            <button type="button" className="secondary-button" onClick={downloadAll}>
-              {completeItems.length === 1 ? "Download result" : `Download ${completeItems.length} as ZIP`}
-              <span>↓</span>
             </button>
           )}
           {batchMessage && <p className="batch-message" role="status">{batchMessage}</p>}
         </aside>
       </section>
 
-      <section className="method-section" aria-labelledby="method-title">
-        <div className="method-intro">
-          <div className="eyebrow"><span>03</span> The method</div>
-          <h2 id="method-title">The script’s rules,<br />made visible.</h2>
+      {showLongRunningMessage && (
+        <div className="long-running-message" role="status" aria-live="polite">
+          <div className="reassurance-icon" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+          <div className="reassurance-copy">
+            <strong>Still working its magic</strong>
+            <p>No need to wait here—I’ll chime when your files are ready.</p>
+          </div>
+          <button
+            type="button"
+            className="reassurance-close"
+            onClick={() => setShowLongRunningMessage(false)}
+            aria-label="Close progress message"
+            title="Close"
+          >
+            ×
+          </button>
         </div>
-        <div className="method-list">
-          <article>
-            <span>01</span>
-            <h3>Read every pixel</h3>
-            <p>PNG, JPG, WebP, BMP, HEIC, and AVIF are decoded locally at their original width and height.</p>
-          </article>
-          <article>
-            <span>02</span>
-            <h3>Search, don’t guess</h3>
-            <p>A binary search tests quality 1–100, or 2–256 colors for PNG, to find the best fit.</p>
-          </article>
-          <article>
-            <span>03</span>
-            <h3>Honor the ceiling</h3>
-            <p>Sizes use decimal KB. Files are accepted only beneath the target minus the safety margin.</p>
-          </article>
-          <article>
-            <span>04</span>
-            <h3>Never resize</h3>
-            <p>When minimum quality still cannot fit, the file fails gracefully and its dimensions remain untouched.</p>
-          </article>
-        </div>
-      </section>
-
-      <footer>
-        <a className="brand footer-brand" href="#top"><span className="brand-mark">PL</span><span>PixelLock</span></a>
-        <p>Your files never leave this device.</p>
-        <span>Strict Pixel Dimension Compressor</span>
-      </footer>
+      )}
     </main>
   );
 }

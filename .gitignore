@@ -35,6 +35,14 @@ yarn-error.log*
 .vercel
 
 /dist/
+/dist-pages/
 /.wrangler/
 /outputs/
 /work/
+*.tsbuildinfo
+
+# Local image folders
+/Input/*
+!/Input/.gitkeep
+/Output/*
+!/Output/.gitkeep

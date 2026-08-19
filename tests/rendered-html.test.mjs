@@ -20,11 +20,13 @@ test("renders the complete PixelLock application shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   const html = await response.text();
-  assert.match(html, /<title>PixelLock — Strict Dimension Image Compressor<\/title>/i);
+  assert.match(html, /<title>PixelLock — Local Folder Image Compressor<\/title>/i);
   assert.match(html, /Smaller files\./);
   assert.match(html, /Every pixel stays\./);
-  assert.match(html, /Compress images/);
-  assert.match(html, /Private browser processing/);
+  assert.match(html, /Convert Input to Output/);
+  assert.match(html, /Local folder processing/);
+  assert.match(html, /Choose Input folder/);
+  assert.match(html, /Choose Output folder/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/i);
 });
 
