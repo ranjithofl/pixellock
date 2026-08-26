@@ -5,6 +5,7 @@ import { NotFoundPage } from "../features/tool-directory/NotFoundPage";
 import type { PdfToolKind } from "../features/pdf-tools/ui/PdfTool";
 import { findConverterCategory } from "./converterCatalog";
 import { findConverterTool } from "./toolCatalog";
+import { getAppPath } from "./routing";
 
 const GifCompressor = lazy(async () => {
   const module = await import("../features/gif-compression/ui/GifCompressor");
@@ -20,7 +21,7 @@ function lazyPage(page: ReactNode) {
 }
 
 export default function App() {
-  const pathname = window.location.pathname;
+  const pathname = getAppPath();
   if (pathname === "/") {
     return (
       <ImageConverter

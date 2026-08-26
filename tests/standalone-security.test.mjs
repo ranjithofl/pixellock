@@ -16,6 +16,7 @@ test("keeps the architecture small and separated", async () => {
   const required = [
     "src/app/App.tsx",
     "src/app/converterCatalog.ts",
+    "src/app/routing.ts",
     "src/app/toolCatalog.ts",
     "src/main.tsx",
     "src/components/layout/SiteHeader.tsx",
@@ -86,7 +87,7 @@ test("provides a catalog with dedicated converter routes", async () => {
   ].map((match) => match[1]);
   assert.equal(categoryPaths.length, 5);
   assert.equal(new Set(categoryPaths).size, categoryPaths.length);
-  assert.match(app, /const pathname = window\.location\.pathname/);
+  assert.match(app, /const pathname = getAppPath\(\)/);
   assert.match(app, /pathname === "\/"/);
   assert.match(app, /findConverterCategory\(pathname\)/);
   assert.match(app, /category\?\.id === "image"/);
@@ -95,6 +96,7 @@ test("provides a catalog with dedicated converter routes", async () => {
   assert.match(header, /<summary>/);
   assert.match(header, /All converters/);
   assert.match(header, /converterCategories\.map/);
+  assert.match(header, /appHref\("\/"\)/);
   assert.match(header, /\/tools\/gif-compressor/);
   assert.match(header, /\/pdf-tools\/compress/);
   assert.match(header, /\/pdf-tools\/organize/);

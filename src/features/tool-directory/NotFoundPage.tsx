@@ -1,5 +1,6 @@
 import { Button } from "../../components/ui";
 import { SiteHeader } from "../../components/layout/SiteHeader";
+import { appHref } from "../../app/routing";
 
 export function NotFoundPage() {
   return (
@@ -9,7 +10,7 @@ export function NotFoundPage() {
         <span>404</span>
         <h1>Tool not found.</h1>
         <p>This local tool address does not exist.</p>
-        <Button onClick={() => window.location.assign("/")}>View all tools</Button>
+        <Button onClick={() => window.location.assign(appHref("/"))}>View all tools</Button>
       </section>
     </main>
   );
