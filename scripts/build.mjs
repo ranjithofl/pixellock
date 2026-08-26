@@ -1,4 +1,4 @@
-import { rename, rm } from "node:fs/promises";
+import { copyFile, rename, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
@@ -7,6 +7,7 @@ const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const publicRoot = resolve(projectRoot, "dist");
 const previousRoot = resolve(projectRoot, "dist.previous");
 const stagingRoot = resolve(projectRoot, "dist.staging");
+const pagesBuild = process.env.PIXELLOCK_DEPLOY_BASE === "/pixellock/";
 
 await rm(stagingRoot, { force: true, recursive: true });
 
@@ -19,6 +20,10 @@ try {
       emptyOutDir: true,
     },
   });
+
+  if (pagesBuild) {
+    await copyFile(resolve(stagingRoot, "index.html"), resolve(stagingRoot, "404.html"));
+  }
 
   await rm(previousRoot, { force: true, recursive: true });
 
