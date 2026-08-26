@@ -2,7 +2,10 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import { securityHeaders } from "./config/security-headers.mjs";
 
+const deployBase = process.env.PIXELLOCK_DEPLOY_BASE ?? "/";
+
 export default defineConfig({
+  base: deployBase,
   plugins: [react()],
   publicDir: "public",
   server: {
