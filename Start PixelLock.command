@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 
 if [[ ! -d node_modules ]]; then
   echo "Preparing PixelLock for the first run..."
-  npm install --no-audit --no-fund
+  npm ci --ignore-scripts --no-fund
 fi
 
 echo ""
@@ -16,4 +16,4 @@ echo "Open http://localhost:3000 in Chrome or Edge."
 echo "Press Control+C here when you want to stop it."
 echo ""
 
-npm run dev
+npm run app
