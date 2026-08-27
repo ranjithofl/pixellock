@@ -31,6 +31,14 @@ export function ChevronDownIcon({ className }: IconProps) {
   );
 }
 
+export function CheckIcon({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="m5 12.5 4.5 4.5L19 7.5" />
+    </svg>
+  );
+}
+
 export function ToolIcon({ className, kind }: IconProps & { kind: ToolIconKind }) {
   const paths: Record<ToolIconKind, ReactNode> = {
     image: <><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8.5" cy="9" r="1.5" /><path d="m5 17 4.5-4.5 3.5 3 2.5-2.5 3.5 4" /></>,

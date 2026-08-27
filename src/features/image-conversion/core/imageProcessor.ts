@@ -41,6 +41,17 @@ export type ProcessedResult = {
 
 export type ProcessOptions = {
   allowScaling?: boolean;
+  preferredQuality?: number;
+};
+
+export type QualityPreview = {
+  blob: Blob;
+  estimatedBytes: number;
+  height: number;
+  parameter: number;
+  parameterLabel: "Quality" | "Colors" | "Lossless";
+  sizeIsEstimated: boolean;
+  width: number;
 };
 
 type DecodeResult = {
@@ -119,6 +130,16 @@ const MAXIMUM_PARAMETER: Record<OutputFormat, number> = {
   BMP: 100,
   PDF: 100,
 };
+
+const normalizedQuality = (quality: number) =>
+  clamp(Math.round(quality), 1, 100);
+
+function qualityToParameter(format: OutputFormat, quality: number) {
+  const normalized = normalizedQuality(quality);
+  if (format === "PNG") return 2 + Math.round(((normalized - 1) / 99) * 254);
+  if (format === "BMP") return 100;
+  return normalized;
+}
 
 const decodeCache = new WeakMap<File, Promise<DecodeResult>>();
 const encodeCache = new WeakMap<File, Map<string, Promise<Blob>>>();
@@ -666,6 +687,50 @@ export function warmImageEncoder(format: OutputFormat) {
   return pending;
 }
 
+export async function createQualityPreview(
+  file: File,
+  format: OutputFormat,
+  quality: number,
+): Promise<QualityPreview> {
+  await assertSafeImageFile(file);
+  const decoded = await decodeImageCached(file);
+  const previewFormat: OutputFormat =
+    format === "HEIC" || format === "PDF" ? "JPEG" : format;
+  const source =
+    previewFormat === "JPEG"
+      ? flattenTransparencyOnWhite(decoded.imageData)
+      : decoded.imageData;
+  const maximumDimension = 1_200;
+  const scale = Math.min(1, maximumDimension / Math.max(source.width, source.height));
+  const width = Math.max(1, Math.round(source.width * scale));
+  const height = Math.max(1, Math.round(source.height * scale));
+  const previewImage =
+    width === source.width && height === source.height
+      ? source
+      : createImageScaler(source)(width, height);
+  const parameter = qualityToParameter(format, quality);
+  const previewParameter = qualityToParameter(previewFormat, quality);
+  const blob = await encodeImage(previewImage, previewFormat, previewParameter);
+  const sourcePixelCount = source.width * source.height;
+  const previewPixelCount = width * height;
+  const pixelRatio = sourcePixelCount / previewPixelCount;
+  const sizeIsEstimated = pixelRatio > 1.01 || previewFormat !== format;
+  const estimatedBytes = sizeIsEstimated
+    ? Math.max(blob.size, Math.round(blob.size * Math.pow(pixelRatio, 0.94)))
+    : blob.size;
+
+  return {
+    blob,
+    estimatedBytes,
+    width,
+    height,
+    parameter,
+    parameterLabel:
+      format === "PNG" ? "Colors" : format === "BMP" ? "Lossless" : "Quality",
+    sizeIsEstimated,
+  };
+}
+
 function encodeImageCached(
   file: File,
   imageData: ImageData,
@@ -727,7 +792,7 @@ async function processHeic(
   options: ProcessOptions = {},
 ): Promise<ProcessedResult> {
   const response = await fetch(
-    `/api/image-convert?target=heic&maxKb=${encodeURIComponent(maxSizeKb)}&allowScaling=${options.allowScaling ? "1" : "0"}`,
+    `/api/image-convert?target=heic&maxKb=${encodeURIComponent(maxSizeKb)}&allowScaling=${options.allowScaling ? "1" : "0"}&preferredQuality=${encodeURIComponent(normalizedQuality(options.preferredQuality ?? 100))}`,
     {
       body: file,
       headers: {
@@ -804,6 +869,14 @@ export async function processImage(
       : decoded.imageData;
   let attempts = 0;
   const totalAttempts = options.allowScaling ? 40 : 14;
+  const preferredMaximumParameter = qualityToParameter(
+    format,
+    options.preferredQuality ?? 100,
+  );
+  const protectedMinimumParameter = Math.min(
+    MINIMUM_PARAMETER[format],
+    preferredMaximumParameter,
+  );
 
   const encodeAndReport = async (
     imageData: ImageData,
@@ -835,8 +908,8 @@ export async function processImage(
 
   const searchBestParameter = async (
     imageData: ImageData,
-    minimumParameter = MINIMUM_PARAMETER[format],
-    maximumParameter = MAXIMUM_PARAMETER[format],
+    minimumParameter = protectedMinimumParameter,
+    maximumParameter = preferredMaximumParameter,
   ) => {
     let low = minimumParameter;
     let high = maximumParameter;
@@ -859,7 +932,7 @@ export async function processImage(
     bestBlob = minimumBlob;
     bestParameter = low;
 
-    if (format === "WEBP") {
+    if (format === "WEBP" && options.preferredQuality === undefined) {
       const targetBlob = await encodeAndReport(
         imageData,
         high,
@@ -909,7 +982,8 @@ export async function processImage(
     smallestBlobSize,
     automaticParameter,
   } = await searchBestParameter(workingImage);
-  let qualityProtected = true;
+  let qualityProtected =
+    preferredMaximumParameter >= MINIMUM_PARAMETER[format];
 
   if (!bestBlob && !options.allowScaling && format !== "BMP") {
     qualityProtected = false;
@@ -921,7 +995,7 @@ export async function processImage(
     } = await searchBestParameter(
       workingImage,
       ABSOLUTE_MINIMUM_PARAMETER[format],
-      MINIMUM_PARAMETER[format] - 1,
+      protectedMinimumParameter - 1,
     ));
   }
 
@@ -944,7 +1018,7 @@ export async function processImage(
       const candidate = scaleImage(width, height);
       const blob = await encodeAndReport(
         candidate,
-        MINIMUM_PARAMETER[format],
+        protectedMinimumParameter,
         "scaling",
       );
 
@@ -970,7 +1044,7 @@ export async function processImage(
         const candidate = scaleImage(width, height);
         const blob = await encodeAndReport(
           candidate,
-          MINIMUM_PARAMETER[format],
+          protectedMinimumParameter,
           "scaling",
         );
 

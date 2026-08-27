@@ -103,7 +103,7 @@ test("provides a catalog with dedicated converter routes", async () => {
   assert.match(header, /\/pdf-tools\/split/);
   assert.match(converter, /fixedFormat \?/);
   assert.match(converter, /<Select/);
-  assert.match(converter, /event\.target\.value as OutputFormat/);
+  assert.match(converter, /onValueChange/);
   assert.doesNotMatch(converter, /className="format-grid"/);
   assert.match(fileConverter, /category\.engine === "pdf"/);
   assert.match(fileConverter, /\/api\/office-convert/);
@@ -142,6 +142,13 @@ test("exposes only implemented image and PDF targets", async () => {
   }
   assert.match(imageProcessor, /encodeBmp/);
   assert.match(imageProcessor, /encodePdfPage/);
+  assert.match(imageProcessor, /createQualityPreview/);
+  assert.match(imageProcessor, /preferredQuality\?: number/);
+  assert.match(imageConverter, /Adjust quality/);
+  assert.match(imageConverter, /manualQuality/);
+  assert.match(imageConverter, /Linked comparison view/);
+  assert.match(imageConverter, /previewPan/);
+  assert.match(imageConverter, /quality-comparison-zoom/);
   assert.match(pdfProcessor, /pagesToPptx/);
   assert.match(pdfProcessor, /pagesToDocx/);
   assert.match(pdfProcessor, /pagesToXlsx/);
@@ -180,6 +187,8 @@ test("isolates and bounds native HEIC conversions", async () => {
   assert.match(imageConverter, /shell: false/);
   assert.match(imageConverter, /validSignature/);
   assert.match(imageConverter, /allowedOrigins/);
+  assert.match(imageConverter, /preferredQuality/);
+  assert.match(imageConverter, /Invalid preferred quality/);
   assert.match(imageConverter, /child\.kill\("SIGKILL"\)/);
   assert.match(imageConverter, /await rm\(temporaryRoot/);
   assert.doesNotMatch(

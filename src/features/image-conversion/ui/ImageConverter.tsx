@@ -1,12 +1,14 @@
 import {
   type DragEvent,
   type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import {
+  createQualityPreview,
   formatDecimalKb,
   outputName,
   OutputFormat,
@@ -48,6 +50,7 @@ type QueueItem = {
   outputRelativePath?: string;
   update?: SearchUpdate;
   error?: string;
+  manualQuality?: number;
 };
 
 const formats: Array<{
@@ -101,6 +104,360 @@ function processingErrorMessage(error: unknown) {
   return error.message;
 }
 
+function qualityDescription(quality: number) {
+  if (quality >= 95) return "Maximum detail";
+  if (quality >= 85) return "High quality";
+  if (quality >= 70) return "Balanced";
+  if (quality >= 50) return "Compact";
+  return "Strong compression";
+}
+
+function clampValue(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function QualityEditor({
+  format,
+  item,
+  maxSizeKb,
+  onApply,
+  onClose,
+}: {
+  format: OutputFormat;
+  item: QueueItem;
+  maxSizeKb: number;
+  onApply: (quality?: number) => void;
+  onClose: () => void;
+}) {
+  const [quality, setQuality] = useState(item.manualQuality ?? 100);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [previewDetail, setPreviewDetail] = useState("");
+  const [previewError, setPreviewError] = useState("");
+  const [isPreviewing, setIsPreviewing] = useState(true);
+  const [sizeForecast, setSizeForecast] = useState<{
+    bytes: number;
+    estimated: boolean;
+  } | null>(null);
+  const [zoomPercent, setZoomPercent] = useState(100);
+  const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
+  const [isPreviewPanning, setIsPreviewPanning] = useState(false);
+  const editorRef = useRef<HTMLElement | null>(null);
+  const originalViewportRef = useRef<HTMLButtonElement | null>(null);
+  const panStartRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const previewUrlRef = useRef("");
+  const strictLimitBytes = Math.max(0, Math.floor(maxSizeKb * 1_000));
+  const forecastFits = Boolean(
+    sizeForecast && sizeForecast.bytes <= strictLimitBytes,
+  );
+
+  useEffect(() => {
+    editorRef.current?.scrollTo({ top: 0 });
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      setIsPreviewing(true);
+      setPreviewError("");
+      setSizeForecast(null);
+      void createQualityPreview(item.file, format, quality)
+        .then((preview) => {
+          if (cancelled) return;
+          const nextUrl = URL.createObjectURL(preview.blob);
+          if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+          previewUrlRef.current = nextUrl;
+          setPreviewUrl(nextUrl);
+          setPreviewDetail(
+            `${preview.parameterLabel} ${preview.parameter} · ${preview.width} × ${preview.height} preview`,
+          );
+          setSizeForecast({
+            bytes: preview.estimatedBytes,
+            estimated: preview.sizeIsEstimated,
+          });
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) {
+            setPreviewError(
+              error instanceof Error ? error.message : "The quality preview could not be created.",
+            );
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setIsPreviewing(false);
+        });
+    }, 220);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [format, item.file, quality]);
+
+  useEffect(
+    () => () => {
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    },
+    [],
+  );
+
+  const panLimits = (
+    viewport: HTMLButtonElement | null,
+    nextZoomPercent = zoomPercent,
+  ) => {
+    if (!viewport || nextZoomPercent <= 100) return { x: 0, y: 0 };
+    const image = viewport.querySelector("img");
+    if (!image) return { x: 0, y: 0 };
+
+    const currentScale = Math.max(1, zoomPercent / 100);
+    const nextScale = nextZoomPercent / 100;
+    const imageRect = image.getBoundingClientRect();
+    const baseWidth = imageRect.width / currentScale;
+    const baseHeight = imageRect.height / currentScale;
+
+    return {
+      x: Math.max(0, (baseWidth * nextScale - viewport.clientWidth) / 2),
+      y: Math.max(0, (baseHeight * nextScale - viewport.clientHeight) / 2),
+    };
+  };
+
+  const updateZoom = (nextValue: number) => {
+    const nextZoom = clampValue(Math.round(nextValue), 100, 400);
+    const limits = panLimits(originalViewportRef.current, nextZoom);
+    setZoomPercent(nextZoom);
+    setPreviewPan((current) => ({
+      x: clampValue(current.x, -limits.x, limits.x),
+      y: clampValue(current.y, -limits.y, limits.y),
+    }));
+  };
+
+  const resetComparisonView = () => {
+    setZoomPercent(100);
+    setPreviewPan({ x: 0, y: 0 });
+  };
+
+  const startPreviewPan = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (zoomPercent <= 100 || event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panStartRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: previewPan.x,
+      originY: previewPan.y,
+    };
+    setIsPreviewPanning(true);
+  };
+
+  const movePreviewPan = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const start = panStartRef.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const limits = panLimits(event.currentTarget);
+    setPreviewPan({
+      x: clampValue(start.originX + event.clientX - start.startX, -limits.x, limits.x),
+      y: clampValue(start.originY + event.clientY - start.startY, -limits.y, limits.y),
+    });
+  };
+
+  const stopPreviewPan = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (panStartRef.current?.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    panStartRef.current = null;
+    setIsPreviewPanning(false);
+  };
+
+  const handlePreviewKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (zoomPercent <= 100) return;
+    const movement = event.shiftKey ? 64 : 24;
+    const directions: Record<string, { x: number; y: number }> = {
+      ArrowLeft: { x: -movement, y: 0 },
+      ArrowRight: { x: movement, y: 0 },
+      ArrowUp: { x: 0, y: -movement },
+      ArrowDown: { x: 0, y: movement },
+    };
+    const direction = directions[event.key];
+    if (!direction) return;
+    event.preventDefault();
+    const limits = panLimits(event.currentTarget);
+    setPreviewPan((current) => ({
+      x: clampValue(current.x + direction.x, -limits.x, limits.x),
+      y: clampValue(current.y + direction.y, -limits.y, limits.y),
+    }));
+  };
+
+  const sharedPreviewStyle = {
+    transform: `translate3d(${previewPan.x}px, ${previewPan.y}px, 0) scale(${zoomPercent / 100})`,
+  };
+  const previewViewportClass = `quality-preview-image${zoomPercent > 100 ? " is-pannable" : ""}${isPreviewPanning ? " is-panning" : ""}`;
+
+  return (
+    <div className="quality-editor-backdrop">
+      <section
+        ref={editorRef}
+        className="quality-editor"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="quality-editor-title"
+      >
+        <header className="quality-editor-header">
+          <div>
+            <span className="quality-editor-kicker">Instant Drop · {format}</span>
+            <h2 id="quality-editor-title">Adjust image quality</h2>
+            <p title={item.file.name}>{item.file.name}</p>
+          </div>
+          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close quality editor">×</Button>
+        </header>
+
+        <div className="quality-preview-grid">
+          <article className="quality-preview-card">
+            <div className="quality-preview-label"><strong>Original</strong><span>{formatDecimalKb(item.file.size)}</span></div>
+            <button
+              type="button"
+              ref={originalViewportRef}
+              className={previewViewportClass}
+              aria-label={`Original synchronized preview at ${zoomPercent}% zoom`}
+              aria-describedby="quality-pan-instructions"
+              onPointerDown={startPreviewPan}
+              onPointerMove={movePreviewPan}
+              onPointerUp={stopPreviewPan}
+              onPointerCancel={stopPreviewPan}
+              onKeyDown={handlePreviewKeyDown}
+            >
+              <img src={item.sourceUrl} alt="Original preview" style={sharedPreviewStyle} draggable={false} />
+            </button>
+          </article>
+          <article className="quality-preview-card">
+            <div className="quality-preview-label"><strong>Quality preview</strong><span>{sizeForecast ? `${sizeForecast.estimated ? "≈ " : ""}${formatDecimalKb(sizeForecast.bytes)}` : `${quality}%`}</span></div>
+            <button
+              type="button"
+              className={previewViewportClass}
+              aria-label={`Quality synchronized preview at ${zoomPercent}% zoom`}
+              aria-describedby="quality-pan-instructions"
+              onPointerDown={startPreviewPan}
+              onPointerMove={movePreviewPan}
+              onPointerUp={stopPreviewPan}
+              onPointerCancel={stopPreviewPan}
+              onKeyDown={handlePreviewKeyDown}
+            >
+              {previewUrl && <img src={previewUrl} alt={`Preview at ${quality}% quality`} style={sharedPreviewStyle} draggable={false} />}
+              {isPreviewing && <span className="quality-preview-loading"><span className="button-spinner" aria-hidden="true" />Rendering preview…</span>}
+              {previewError && <span className="quality-preview-error">{previewError}</span>}
+            </button>
+          </article>
+        </div>
+
+        <div className="quality-view-controls">
+          <div className="quality-view-copy">
+            <strong>Linked comparison view</strong>
+            <span id="quality-pan-instructions">Zoom in, then drag either image. Both previews stay at the same position.</span>
+          </div>
+          <div className="quality-zoom-controls" aria-label="Comparison zoom controls">
+            <Button variant="outline" size="icon" onClick={() => updateZoom(zoomPercent - 25)} disabled={zoomPercent <= 100} aria-label="Zoom out">−</Button>
+            <input
+              id="quality-comparison-zoom"
+              className="quality-zoom-range"
+              type="range"
+              min="100"
+              max="400"
+              step="25"
+              value={zoomPercent}
+              onChange={(event) => updateZoom(Number(event.target.value))}
+              aria-label="Comparison zoom"
+              aria-valuetext={`${zoomPercent}% zoom`}
+            />
+            <output htmlFor="quality-comparison-zoom" aria-live="polite">{zoomPercent}%</output>
+            <Button variant="outline" size="icon" onClick={() => updateZoom(zoomPercent + 25)} disabled={zoomPercent >= 400} aria-label="Zoom in">+</Button>
+            <Button variant="ghost" size="sm" onClick={resetComparisonView} disabled={zoomPercent === 100 && previewPan.x === 0 && previewPan.y === 0}>Reset view</Button>
+          </div>
+        </div>
+
+        <div className="quality-control-panel">
+          <div className="quality-control-heading">
+            <div><strong>{qualityDescription(quality)}</strong><span>{previewDetail || "Preparing visual preview"}</span></div>
+            <output htmlFor="manual-image-quality">{quality}%</output>
+          </div>
+          <div className="quality-slider-shell">
+            <span className="quality-slider-track" aria-hidden="true"><span style={{ width: `${quality}%` }} /></span>
+            <input
+              id="manual-image-quality"
+              className="quality-range"
+              type="range"
+              min="1"
+              max="100"
+              step="1"
+              value={quality}
+              onChange={(event) => {
+                setIsPreviewing(true);
+                setPreviewError("");
+                setSizeForecast(null);
+                setQuality(Number(event.target.value));
+              }}
+              aria-label="Manual image quality"
+              aria-valuetext={`${quality}% · ${qualityDescription(quality)}`}
+            />
+          </div>
+          <div className="quality-range-labels" aria-hidden="true"><span>Smaller file</span><span>Maximum detail</span></div>
+          <div className="quality-presets" aria-label="Quality presets">
+            {[
+              { label: "Maximum", value: 100 },
+              { label: "High", value: 90 },
+              { label: "Balanced", value: 75 },
+              { label: "Compact", value: 60 },
+            ].map((preset) => (
+              <button
+                type="button"
+                className={quality === preset.value ? "selected" : ""}
+                onClick={() => {
+                  setIsPreviewing(true);
+                  setPreviewError("");
+                  setSizeForecast(null);
+                  setQuality(preset.value);
+                }}
+                aria-pressed={quality === preset.value}
+                key={preset.value}
+              >
+                <strong>{preset.label}</strong><span>{preset.value}%</span>
+              </button>
+            ))}
+          </div>
+          {sizeForecast && (
+            <p className={`quality-fit-message ${forecastFits ? "fits" : "over"}`}>
+              {forecastFits
+                ? `${sizeForecast.estimated ? "Estimated to fit" : "Fits"} under the ${maxSizeKb} KB maximum at ${quality}% quality.`
+                : `${sizeForecast.estimated ? "Estimated size is" : "Output is"} above ${maxSizeKb} KB. Final conversion will lower quality until the strict maximum is passed.`}
+            </p>
+          )}
+          {!sizeForecast && <p className="quality-fit-message pending">Calculating the expected output size for this quality…</p>}
+        </div>
+
+        <footer className="quality-editor-actions">
+          <Button variant="ghost" onClick={() => onApply(undefined)}>Use automatic quality</Button>
+          <div><Button variant="outline" onClick={onClose}>Cancel</Button><Button onClick={() => onApply(quality)}>Apply {quality}% quality</Button></div>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
 export default function ImageConverter({
   title = "Image conversion.",
   initialFormat = "WEBP",
@@ -123,6 +480,7 @@ export default function ImageConverter({
   const [isDragging, setIsDragging] = useState(false);
   const [batchMessage, setBatchMessage] = useState("");
   const [showLongRunningMessage, setShowLongRunningMessage] = useState(false);
+  const [qualityEditorId, setQualityEditorId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const completionAudioRef = useRef<AudioContext | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -158,6 +516,7 @@ export default function ImageConverter({
   }, [customSize, sizeMode]);
 
   const completeItems = items.filter((item) => item.status === "done");
+  const qualityEditorItem = items.find((item) => item.id === qualityEditorId);
   const pendingCount = items.filter(
     (item) => item.status === "ready" || item.status === "failed" || item.status === "cancelled",
   ).length;
@@ -342,6 +701,45 @@ export default function ImageConverter({
     );
   };
 
+  const applyManualQuality = (id: string, quality?: number) => {
+    const itemName = items.find((item) => item.id === id)?.file.name ?? "Image";
+    const manualQuality = quality === undefined
+      ? undefined
+      : Math.max(1, Math.min(100, Math.round(quality)));
+    setItems((current) =>
+      current.map((item) => {
+        if (item.id !== id) return item;
+        if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
+        return {
+          ...item,
+          status: "ready",
+          manualQuality,
+          resultBlob: undefined,
+          resultUrl: undefined,
+          resultName: undefined,
+          outputRelativePath: undefined,
+          width: undefined,
+          height: undefined,
+          originalWidth: undefined,
+          originalHeight: undefined,
+          scaled: undefined,
+          automaticParameter: undefined,
+          qualityProtected: undefined,
+          parameter: undefined,
+          parameterLabel: undefined,
+          update: undefined,
+          error: undefined,
+        };
+      }),
+    );
+    setQualityEditorId(null);
+    setBatchMessage(
+      manualQuality === undefined
+        ? `${itemName} returned to automatic best-fit quality.`
+        : `${itemName} will start at ${manualQuality}% quality and still respect the strict size target.`,
+    );
+  };
+
   const prepareCompletionAudio = () => {
     const AudioContextClass = window.AudioContext ?? window.webkitAudioContext;
     if (!AudioContextClass) return;
@@ -435,7 +833,7 @@ export default function ImageConverter({
           maxSizeKb,
           (update) => updateItem(item.id, { update }),
           controller.signal,
-          { allowScaling },
+          { allowScaling, preferredQuality: item.manualQuality },
         );
         const resultName = outputName(item.file.name, format, result.scaled);
         if (workflowMode === "folder" && outputDirectory) {
@@ -574,6 +972,7 @@ export default function ImageConverter({
   };
 
   const removeItem = (id: string) => {
+    if (qualityEditorId === id) setQualityEditorId(null);
     setItems((current) => {
       const item = current.find((entry) => entry.id === id);
       if (item) {
@@ -594,6 +993,7 @@ export default function ImageConverter({
     setInputDirectory(null);
     setBatchMessage("");
     setShowLongRunningMessage(false);
+    setQualityEditorId(null);
   };
 
   const changeWorkflowMode = (nextMode: "folder" | "instant") => {
@@ -849,6 +1249,9 @@ export default function ImageConverter({
                             ? "Best-fit quality"
                             : `${item.parameterLabel} ${item.parameter}`}
                           {` · Strict ${maxSizeKb} KB maximum passed`}
+                          {item.manualQuality
+                            ? ` · Manual ${item.manualQuality}% ceiling`
+                            : " · Automatic quality"}
                           {item.qualityProtected
                             ? " · High-quality floor protected"
                             : " · Best achievable quality at original dimensions"}
@@ -862,6 +1265,17 @@ export default function ImageConverter({
                       )}
                     </div>
                     <div className="item-actions">
+                      {workflowMode === "instant" && format !== "BMP" && item.status !== "processing" && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="quality-adjust-button"
+                          onClick={() => setQualityEditorId(item.id)}
+                          aria-label={`Adjust quality for ${item.file.name}`}
+                        >
+                          {item.manualQuality ? `Quality ${item.manualQuality}%` : "Adjust quality"}
+                        </Button>
+                      )}
                       <Badge
                         variant={
                           item.status === "done"
@@ -934,7 +1348,7 @@ export default function ImageConverter({
                 id="image-output-format"
                 aria-label="Output format"
                 value={format}
-                onChange={(event) => changeFormat(event.target.value as OutputFormat)}
+                onValueChange={(nextFormat) => changeFormat(nextFormat as OutputFormat)}
                 disabled={isProcessing}
               >
                 {formats.map((option) => (
@@ -1055,6 +1469,17 @@ export default function ImageConverter({
           {batchMessage && <p className="batch-message" role="status">{batchMessage}</p>}
         </aside>
       </section>
+
+      {qualityEditorItem && workflowMode === "instant" && format !== "BMP" && (
+        <QualityEditor
+          key={`${qualityEditorItem.id}-${format}`}
+          format={format}
+          item={qualityEditorItem}
+          maxSizeKb={maxSizeKb}
+          onApply={(quality) => applyManualQuality(qualityEditorItem.id, quality)}
+          onClose={() => setQualityEditorId(null)}
+        />
+      )}
 
       {showLongRunningMessage && (
         <div className="long-running-message" role="status" aria-live="polite">

@@ -247,8 +247,8 @@ export function FileConverter({ category }: { category: ConverterCategory }) {
               id={`${category.id}-output-format`}
               aria-label="Output format"
               value={output}
-              onChange={(event) => {
-                setOutput(event.target.value);
+              onValueChange={(nextOutput) => {
+                setOutput(nextOutput);
                 setError("");
                 clearResult();
               }}

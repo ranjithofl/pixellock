@@ -165,6 +165,14 @@ export async function handleImageConversion(req, res, requestUrl, port) {
     return;
   }
   const allowScaling = requestUrl.searchParams.get("allowScaling") === "1";
+  const preferredQuality = Number.parseInt(
+    requestUrl.searchParams.get("preferredQuality") ?? "100",
+    10,
+  );
+  if (!Number.isSafeInteger(preferredQuality) || preferredQuality < 1 || preferredQuality > 100) {
+    sendText(res, 400, "Invalid preferred quality");
+    return;
+  }
 
   let originalName;
   try {
@@ -226,7 +234,7 @@ export async function handleImageConversion(req, res, requestUrl, port) {
 
     const searchQuality = async (width, height, minimumQuality) => {
       let low = minimumQuality;
-      let high = 100;
+      let high = preferredQuality;
       let best = null;
       while (low <= high) {
         const quality = Math.floor((low + high) / 2);
@@ -241,8 +249,9 @@ export async function handleImageConversion(req, res, requestUrl, port) {
       return best;
     };
 
-    let best = await searchQuality(dimensions.width, dimensions.height, protectedQuality);
-    let qualityProtected = true;
+    const preferredMinimumQuality = Math.min(protectedQuality, preferredQuality);
+    let best = await searchQuality(dimensions.width, dimensions.height, preferredMinimumQuality);
+    let qualityProtected = preferredQuality >= protectedQuality;
     let scaled = false;
 
     if (!best && !allowScaling) {
@@ -251,7 +260,7 @@ export async function handleImageConversion(req, res, requestUrl, port) {
     }
 
     if (!best && allowScaling) {
-      const baseline = await encode(protectedQuality);
+      const baseline = await encode(preferredMinimumQuality);
       const minimumScale = Math.max(1 / dimensions.width, 1 / dimensions.height);
       let probeScale = Math.max(
         minimumScale,
@@ -262,7 +271,7 @@ export async function handleImageConversion(req, res, requestUrl, port) {
       while (fittingScale < 0) {
         const width = Math.max(1, Math.round(dimensions.width * probeScale));
         const height = Math.max(1, Math.round(dimensions.height * probeScale));
-        const candidate = await encode(protectedQuality, width, height);
+        const candidate = await encode(preferredMinimumQuality, width, height);
         if (candidate.size <= targetBytes) {
           fittingScale = probeScale;
           best = candidate;
@@ -279,7 +288,7 @@ export async function handleImageConversion(req, res, requestUrl, port) {
           const scale = (lowScale + highScale) / 2;
           const width = Math.max(1, Math.round(dimensions.width * scale));
           const height = Math.max(1, Math.round(dimensions.height * scale));
-          const candidate = await encode(protectedQuality, width, height);
+          const candidate = await encode(preferredMinimumQuality, width, height);
           if (candidate.size <= targetBytes) {
             fittingScale = scale;
             best = candidate;
@@ -290,7 +299,7 @@ export async function handleImageConversion(req, res, requestUrl, port) {
         }
         const width = Math.max(1, Math.round(dimensions.width * fittingScale));
         const height = Math.max(1, Math.round(dimensions.height * fittingScale));
-        best = await searchQuality(width, height, protectedQuality) ?? best;
+        best = await searchQuality(width, height, preferredMinimumQuality) ?? best;
         scaled = width !== dimensions.width || height !== dimensions.height;
       }
     }

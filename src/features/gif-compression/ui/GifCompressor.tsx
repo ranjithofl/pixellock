@@ -163,7 +163,7 @@ export function GifCompressor() {
         </div>
         <aside className="settings-panel" aria-label="GIF compression settings">
           <div className="settings-heading"><span className="step-number">02</span><h2>Protect the animation</h2></div>
-          <label className="output-format-control" htmlFor="gif-color-profile"><span>Color profile</span><Select id="gif-color-profile" value={quality} disabled={isProcessing} onChange={(event) => { setQuality(event.target.value as GifQuality); clearResult(); }}><option value="maximum">Maximum quality — up to 256 colors</option><option value="balanced">Balanced — up to 128 colors</option><option value="compact">Compact — up to 64 colors</option></Select><small className="setting-help">Frame timing, looping, transparency, and animation are preserved.</small></label>
+          <label className="output-format-control" htmlFor="gif-color-profile"><span>Color profile</span><Select id="gif-color-profile" value={quality} disabled={isProcessing} onValueChange={(nextQuality) => { setQuality(nextQuality as GifQuality); clearResult(); }}><option value="maximum">Maximum quality — up to 256 colors</option><option value="balanced">Balanced — up to 128 colors</option><option value="compact">Compact — up to 64 colors</option></Select><small className="setting-help">Frame timing, looping, transparency, and animation are preserved.</small></label>
           {progressMessage && <div className="file-conversion-progress" aria-live="polite"><Progress value={progress.value} max={progress.max} /><span>{progressMessage}</span></div>}
           {error && <p className="converter-error" role="alert">{error}</p>}
           {result ? (

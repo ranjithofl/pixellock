@@ -251,7 +251,7 @@ export function PdfTool({ kind }: { kind: PdfToolKind }) {
         <aside className="settings-panel" aria-label={`${copy.title} settings`}>
           <div className="settings-heading"><span className="step-number">02</span><h2>Set the result</h2></div>
           {kind === "compress" && (
-            <label className="output-format-control" htmlFor="pdf-compression-profile"><span>Compression profile</span><Select id="pdf-compression-profile" value={preset} disabled={isProcessing} onChange={(event) => { setPreset(event.target.value as CompressionPreset); clearResult(); }}><option value="quality">Quality — sharpest rebuild</option><option value="balanced">Balanced — smaller, clear pages</option><option value="compact">Compact — strongest reduction</option></Select><small className="setting-help">Compression rebuilds each page visually. Selectable text and links are not retained.</small></label>
+            <label className="output-format-control" htmlFor="pdf-compression-profile"><span>Compression profile</span><Select id="pdf-compression-profile" value={preset} disabled={isProcessing} onValueChange={(nextPreset) => { setPreset(nextPreset as CompressionPreset); clearResult(); }}><option value="quality">Quality — sharpest rebuild</option><option value="balanced">Balanced — smaller, clear pages</option><option value="compact">Compact — strongest reduction</option></Select><small className="setting-help">Compression rebuilds each page visually. Selectable text and links are not retained.</small></label>
           )}
           {kind === "organize" && <p className="tool-guidance">Reorder, rotate, or remove pages. Page content is copied without rasterizing it.</p>}
           {kind === "split" && (
